@@ -10,6 +10,15 @@
 
 #include "pierce.h"
 
+/* PIERCE_LOCAL_ONLY=1 keeps a run on this machine (used by the smoke
+   tests): no public STUN servers, no router port mapping, loopback offered. */
+static uint32_t local_only_flags(void)
+{
+    const char *e = getenv("PIERCE_LOCAL_ONLY");
+    if (!e || !*e || *e == '0') return 0;
+    return PIERCE_CFG_NO_DEFAULT_STUN | PIERCE_CFG_NO_PORT_MAPPING | PIERCE_CFG_INCLUDE_LOOPBACK;
+}
+
 static int unhex(const char *s, uint8_t *out, int cap)
 {
     int n = (int)strlen(s) / 2;
@@ -33,6 +42,7 @@ int main(int argc, char **argv)
     }
     pierce_config cfg;
     pierce_config_init(&cfg);
+    cfg.flags |= local_only_flags();
     pierce_ctx *ctx;
     int rc = pierce_ctx_create(&cfg, &ctx);
     if (rc != PIERCE_OK) {

@@ -19,7 +19,7 @@ One UDP socket carries everything. The first byte decides:
 |---|---|
 | `0x00`–`0x3F` with STUN magic cookie at bytes 4–7 | STUN (binding only) |
 | `0x50`–`0x56` | Pierce peer packets (section 3) |
-| `0x60`–`0x65` | Relay protocol (section 5), only from/to a configured relay |
+| `0x60`–`0x65` | Relay protocol (section 6), only from/to a configured relay |
 
 Anything else is dropped.
 
@@ -52,7 +52,8 @@ u8 kind           1 = offer, 2 = answer, 3 = candidates
 [16] session      random, chosen by the initiator; routes every later blob
 [32] secret       offer and answer only: random per connection
 [8] host_hint     offer only: first 8 bytes of the host key, or zero (XX)
-u8 flags          0
+u8 flags          bits 0-1: sender's NAT class (0 unknown, 1 easy, 2 hard/symmetric)
+                  bit 2: sender has a router port mapping (reachable by anyone)
 u8 ncand          0..24
 cand * ncand
 ```
@@ -65,6 +66,7 @@ A candidate is `u8 type` followed by:
 | 4 relay | `[8] relay server id`, `[8] relay allocation id` |
 
 A host refuses an offer whose non-zero `host_hint` does not match its key.
+A candidates blob with no candidates is sent when only the flags changed.
 
 **Probe key.** `probe_key = BLAKE2b-512(offer_secret || answer_secret)[0..32]`.
 
@@ -83,6 +85,11 @@ A PROBE whose role equals the receiver's own is a reflection and is dropped.
 probes). Each probe uses a fresh txid; an ack must arrive on the path the
 probe left on. A valid PROBE from an unknown address creates a peer-reflexive
 candidate.
+
+**Birthday punching.** Scan probes, sent by the easy side to random ports on
+the hard side's IP, use `txid = BLAKE2b-keyed(probe_key, 16, "bday" || u16 port)[0..8]`.
+An ack whose txid matches the MAC of its own source port is valid, even
+though no state was kept for that port.
 
 ### 3.2 Handshake
 
@@ -166,14 +173,36 @@ DATA  0x56  u8 cid_len(8) [8] dest_cid u16 cid_seq(0) u8 flags u64 pn  ciphertex
   MSG frame from the responder also counts as acceptance.
 - **CLOSE.** CLOSE is sent twice and never acknowledged.
 
-## 4. STUN
+## 4. Router port mapping
+
+All IPv4, all for Pierce's primary UDP port, lease 7200 s (refreshed at half-life,
+deleted with lifetime 0 / `DeletePortMapping` on exit).
+
+- **PCP** (RFC 6887): a MAP request (opcode 1, protocol 17) to the default
+  gateway on port 5351, sent from the primary socket.
+- **NAT-PMP** (RFC 6886): used when PCP gets "unsupported version" or no answer.
+  Sends an external-address request (opcode 0) and a UDP map request (opcode 1).
+- **UPnP-IGD**, in parallel with the above:
+  1. SSDP `M-SEARCH` to `239.255.255.250:1900` for `InternetGatewayDevice:1` and
+     `WANIPConnection:1`.
+  2. HTTP GET of the `LOCATION` description; take the `controlURL` of
+     `WANIPConnection` (else `WANPPPConnection`).
+  3. SOAP `GetExternalIPAddress`, then `AddPortMapping`. On conflicts (718),
+     retry up to three random ports. Fall back to a permanent lease on 725.
+
+The resulting public address is offered as a server-reflexive candidate and
+sets flag bit 2. It is never offered if the router's external address is
+private or carrier-grade (100.64/10), or if a STUN result shows a different
+public IP (double NAT).
+
+## 5. STUN
 
 Pierce sends RFC 5389 Binding Requests (20 bytes, no attributes) and reads
 `XOR-MAPPED-ADDRESS` (preferred) or `MAPPED-ADDRESS` from Binding Success
 responses. Nothing else of STUN is implemented. The reference relay also
 answers Binding Requests.
 
-## 5. Relay protocol
+## 6. Relay protocol
 
 Messages between a client and the relay server, over UDP or over TCP with
 each message prefixed by its length (`u16`).
@@ -221,7 +250,7 @@ Otherwise the relay forwards it as DATA to the endpoint holding
 | 1 shared secret | `u8 1, u64 expiry (Unix seconds), u32 max_kbps (0 = unlimited), [16] BLAKE2b-keyed(secret, 16, first 13 bytes)` (29 bytes) | v1 |
 | 2 signed | Ed25519 | reserved |
 
-## 6. Constants
+## 7. Constants
 
 | Name | Value |
 |---|---|
@@ -233,3 +262,5 @@ Otherwise the relay forwards it as DATA to the endpoint holding
 | Initial / minimum congestion window | 12000 / 2400 bytes |
 | Default keepalive / idle / connect timeout | 15 s / 30 s / 15 s |
 | Relay probe head start for direct paths | 300 ms |
+| Birthday: start delay / window / sockets / scan rate / max probes | 1 s / 10 s / 256 / 250 per s / 2048 |
+| Port mapping lease | 7200 s |

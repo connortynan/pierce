@@ -1,4 +1,4 @@
-# Pierce: Design Spec (Draft v0.3)
+# Pierce: Design Spec (Draft v0.4)
 
 > Peers, pierced through. A low-level C library for NAT-traversing, encrypted, channel-based connections. Serverless peer-to-peer first, dedicated server mode second.
 
@@ -22,7 +22,7 @@ Status: draft. License: MIT. Items marked **[OPEN]** are unresolved decisions. I
 
 - Matchmaking, accounts, lobbies, rooms, presence, message history, offline delivery, push notifications. These are application layers.
 - Anti-cheat, global bans, or any global identity system.
-- HTTP, TLS, or any web-request functionality in the core.
+- TLS or general web requests in the core. The one exception is a minimal HTTP client that only ever talks to the local router, for UPnP port mapping (section 5.5).
 - Browser WebRTC interoperability (browsers connect through an app-provided gateway).
 - Interoperability with standard STUN/TURN/ICE implementations in v1 (a standards-compliant mode is **[DEFER]**, see section 5.4).
 
@@ -168,7 +168,7 @@ Candidates may be sent as they are discovered, not as one batch. This is optiona
 
 ### 5.3.1 Relay protocol
 
-- Peers allocate a relay slot, receive a relay-scoped ID, and exchange it via signaling. Message formats, lifetimes and refresh rules are in [docs/wire.md](docs/wire.md) section 5.
+- Peers allocate a relay slot, receive a relay-scoped ID, and exchange it via signaling. Message formats, lifetimes and refresh rules are in [docs/wire.md](docs/wire.md) section 6.
 - Relay forwards opaque datagrams by ID. Authentication to the relay is separate from peer authentication.
 
 ### 5.3.2 Relay authentication
@@ -196,6 +196,35 @@ Because both ends run Pierce, the scheme does not need RFC-compliant ICE. v1 use
 **[DEFER]** Standards-compliant mode, possibly via an optional libjuice-backed module.
 
 ---
+
+### 5.5 Connectivity ladder: everything on by default
+
+Principle: when two people say "let's connect", the library tries every technique it has, with no flags, arguments or extra builds needed. Techniques run in parallel, cheapest first. The first working path wins, and better paths found later still replace it (relay to direct). Apps opt out with config flags; they never opt in.
+
+| # | Technique | When it helps | Opt out |
+|---|---|---|---|
+| 1 | Host candidates (LAN) | Same network | `PIERCE_CFG_RELAY_ONLY` |
+| 2 | IPv6 | Both sides have IPv6: no NAT at all | `PIERCE_CFG_NO_IPV6` |
+| 3 | STUN hole punching, with built-in public STUN servers (Google, Cloudflare) when the app configures none | Most home NATs | `PIERCE_CFG_NO_DEFAULT_STUN` |
+| 4 | Router port mapping: PCP, then NAT-PMP, with UPnP-IGD in parallel | The router cooperates; makes that side reachable by anyone, even from a symmetric NAT | `PIERCE_CFG_NO_PORT_MAPPING` |
+| 5 | NAT classification: compare what two STUN servers saw, and signal "easy" or "hard" (and "mapped") in the blob flags | Lets both sides pick a strategy and explain failures | — |
+| 6 | Birthday-paradox punching | One side symmetric ("hard"), the other endpoint-independent ("easy") | `PIERCE_CFG_NO_BIRTHDAY` |
+| 7 | Relay over UDP, then TCP/443 | Everything else; needs a relay the app developer configures | — |
+
+Rules:
+
+- **Port mapping.**
+  - Leases are 2 h, refreshed at half-life and removed on clean exit. Only Pierce's UDP port is mapped.
+  - A mapping is advertised only if the router's external address is public *and* agrees with STUN; otherwise the router sits behind another NAT (double NAT, carrier-grade NAT) and the mapping is useless.
+  - The UPnP client is non-blocking, IPv4 only, and talks only to the router found by SSDP.
+- **Birthday punching.**
+  - Starts 1 s into probing, only when classification predicts success and neither side has a port mapping.
+  - The hard side opens up to 256 extra sockets, each a separate NAT mapping aimed at the easy side.
+  - The easy side probes random ports on the hard side's public IP at about 250 per second, up to 2048. Success is above 99% with 256 sockets.
+  - Probes are authenticated like all probes. The transaction ID is a MAC of the target port, so any answering port can be verified without storing state.
+  - Losing sockets close as soon as a path is chosen or after 10 s.
+- **Failure diagnosis.** When no path is found, a warning log says why in plain terms (for example "both sides are behind symmetric NATs, which only a relay (or IPv6) can bridge; no relay is configured"), so an app can show something better than a timeout.
+- **What only infrastructure can fix.** Symmetric NATs on both sides without IPv6, or networks that block UDP entirely, need a relay. That is the app developer's one-time configuration, never the end user's.
 
 ## 6. Channels and Delivery Semantics
 
@@ -630,9 +659,13 @@ Numbers are kept so older references still make sense.
 - **Connection-ID rotation:** deferred, with the wire format designed to allow it later (section 4.5).
 - **Relay authentication:** typed tokens. Shared-secret MAC tokens ship in v1; signed tokens are deferred (section 5.3.2).
 
+### Resolved in v0.4
+
+- **Connectivity defaults:** built-in public STUN servers, router port mapping (PCP/NAT-PMP/UPnP) and birthday punching are all on by default, with opt-out flags (section 5.5). UPnP's HTTP is allowed in the core because it only talks to the local router.
+
 ### Resolved in v0.3 (during implementation)
 
-- **Q13 Relay allocation protocol:** specified in docs/wire.md section 5. Allocations are bound to the source address or TCP connection, refreshed by the client every `min(lifetime / 3, keepalive)`, and expire after 600 s by default. Peers may use each other's relay candidates only when both hold allocations on the same relay instance (matched by server id); the relay is never an open proxy to arbitrary addresses.
+- **Q13 Relay allocation protocol:** specified in docs/wire.md section 6. Allocations are bound to the source address or TCP connection, refreshed by the client every `min(lifetime / 3, keepalive)`, and expire after 600 s by default. Peers may use each other's relay candidates only when both hold allocations on the same relay instance (matched by server id); the relay is never an open proxy to arbitrary addresses.
 
 ---
 

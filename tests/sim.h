@@ -14,11 +14,11 @@
 
 void pierce__test_set_rekey_packets(uint64_t n);
 void pierce__test_set_global_time(uint64_t now_us);
+void pierce__test_set_gateway(pierce_ctx *ctx, const pierce_addr *gw);
 
 #define SIM_MAX_NODES 512
 #define SIM_MAX_NATS 512
-#define SIM_MAX_MAPS 32
-#define SIM_MAX_PERMS 16
+#define SIM_MAX_MAPS 4096
 
 enum { NAT_NONE = 0, NAT_FULL_CONE, NAT_RESTRICTED, NAT_PORT_RESTRICTED, NAT_SYMMETRIC };
 
@@ -37,16 +37,21 @@ static const char *nat_name(int t)
 typedef struct {
     pierce_addr priv, dest;
     uint16_t pub_port;
-    pierce_addr perms[SIM_MAX_PERMS];
-    int nperm;
+    uint8_t open;               /* router port mapping: accepts anyone */
+    pierce_addr *perms;         /* destinations this mapping has sent to */
+    int nperm, capperm;
 } sim_map;
+
+enum { PMP_NONE = 0, PMP_NATPMP = 1, PMP_PCP = 2 };
 
 typedef struct {
     int type;
     uint8_t ip[4];
-    sim_map maps[SIM_MAX_MAPS];
-    int nmaps;
+    sim_map *maps;
+    int nmaps, capmaps;
     uint16_t next_port;
+    int pmp;                    /* PMP_*: the router answers port-mapping requests */
+    uint8_t pmp_report_ip[4];   /* external IP it claims (differs = double NAT) */
 } sim_nat;
 
 typedef struct {
@@ -72,6 +77,7 @@ typedef struct {
     uint32_t last_reason;
     pierce_conn_id last_conn;
     uint32_t last_path;          /* path flags of the last CONNECTED */
+    char last_warn[256];         /* text of the last WARN-or-worse log */
     uint8_t last_peer_key[32];
     uint8_t last_payload[1024];      /* data of the last PEER_REQUEST */
     uint32_t last_payload_len;
@@ -85,6 +91,7 @@ typedef struct {
 
 typedef struct sim_pkt {
     struct sim_pkt *next;
+    uint8_t lan;                /* router -> its own LAN host: no NAT in between */
     uint64_t at;
     pierce_addr src, dst;
     uint32_t len;
@@ -112,7 +119,7 @@ typedef struct {
     uint64_t delay_us, jitter_us, sig_delay_us;
     uint64_t rng;
     int has_stun;
-    pierce_addr stun_addr;
+    pierce_addr stun_addr, stun_addr2;   /* two operators, so NATs can be classified */
     pc_relay_server *relay;
     pierce_addr relay_addr;
     int verbose;
@@ -154,6 +161,7 @@ static void sim_enable_stun(sim *s)
 {
     s->has_stun = 1;
     s->stun_addr = sim_ip(198, 51, 100, 1, 3478);
+    s->stun_addr2 = sim_ip(198, 51, 100, 3, 3478);
 }
 
 static void sim_enable_relay(sim *s, const uint8_t *secret, uint32_t secret_len)
@@ -174,26 +182,54 @@ static int sim_add_nat(sim *s, int type)
     memset(n, 0, sizeof(*n));
     n->type = type;
     n->ip[0] = 203; n->ip[1] = 0; n->ip[2] = (uint8_t)(113 + i / 250); n->ip[3] = (uint8_t)(1 + i % 250);
+    memcpy(n->pmp_report_ip, n->ip, 4);
     n->next_port = 40000;
     return i;
 }
 
 /* ---- NAT translation ---- */
 
+static uint64_t sim_rng_global = 0x9e3779b97f4a7c15ull;
+
+/* Symmetric NATs pick random ports (like the one that motivated birthday
+   punching); cone NATs count up. */
+static uint16_t nat_alloc_port(sim_nat *n)
+{
+    for (;;) {
+        uint16_t port;
+        if (n->type == NAT_SYMMETRIC) {
+            sim_rng_global ^= sim_rng_global << 13;
+            sim_rng_global ^= sim_rng_global >> 7;
+            sim_rng_global ^= sim_rng_global << 17;
+            port = (uint16_t)(1024 + sim_rng_global % (65536 - 1024));
+        } else {
+            port = n->next_port++;
+        }
+        int used = 0;
+        for (int i = 0; i < n->nmaps && !used; i++) used = n->maps[i].pub_port == port;
+        if (!used) return port;
+    }
+}
+
 static sim_map *nat_out(sim_nat *n, const pierce_addr *priv, const pierce_addr *dst)
 {
     for (int i = 0; i < n->nmaps; i++) {
         sim_map *m = &n->maps[i];
         if (!pc_addr_eq(&m->priv, priv)) continue;
+        if (m->open) return m;   /* a port-mapped socket keeps its public port */
         if (n->type == NAT_SYMMETRIC && !pc_addr_eq(&m->dest, dst)) continue;
         return m;
     }
     if (n->nmaps >= SIM_MAX_MAPS) return NULL;
+    if (n->nmaps == n->capmaps) {
+        n->capmaps = n->capmaps ? n->capmaps * 2 : 16;
+        n->maps = (sim_map *)realloc(n->maps, (size_t)n->capmaps * sizeof(sim_map));
+    }
     sim_map *m = &n->maps[n->nmaps++];
     memset(m, 0, sizeof(*m));
     m->priv = *priv;
     m->dest = *dst;
-    m->pub_port = n->next_port++;
+    m->pub_port = nat_alloc_port(n);
     return m;
 }
 
@@ -201,11 +237,22 @@ static void map_permit(sim_map *m, const pierce_addr *dst)
 {
     for (int i = 0; i < m->nperm; i++)
         if (pc_addr_eq(&m->perms[i], dst)) return;
-    if (m->nperm < SIM_MAX_PERMS) m->perms[m->nperm++] = *dst;
+    if (m->nperm == m->capperm) {
+        m->capperm = m->capperm ? m->capperm * 2 : 8;
+        m->perms = (pierce_addr *)realloc(m->perms, (size_t)m->capperm * sizeof(pierce_addr));
+    }
+    m->perms[m->nperm++] = *dst;
+}
+
+static void nat_clear(sim_nat *n)
+{
+    for (int i = 0; i < n->nmaps; i++) free(n->maps[i].perms);
+    n->nmaps = 0;
 }
 
 static int map_allows(const sim_nat *n, const sim_map *m, const pierce_addr *src)
 {
+    if (m->open) return 1;
     switch (n->type) {
     case NAT_FULL_CONE:
         return 1;
@@ -226,7 +273,7 @@ static int map_allows(const sim_nat *n, const sim_map *m, const pierce_addr *src
 /* Clear all mappings: the next packet gets a new public port (rebinding). */
 static void sim_nat_rebind(sim *s, int nat)
 {
-    s->nats[nat].nmaps = 0;
+    nat_clear(&s->nats[nat]);
     s->nats[nat].next_port += 1000;
 }
 
@@ -249,16 +296,40 @@ static void sim_enqueue(sim *s, const pierce_addr *src, const pierce_addr *dst, 
     *l = p;
 }
 
+static int is_server(sim *s, const pierce_addr *a)
+{
+    return (s->relay && pc_addr_eq(a, &s->relay_addr)) ||
+           (s->has_stun && (pc_addr_eq(a, &s->stun_addr) || pc_addr_eq(a, &s->stun_addr2)));
+}
+
+static pierce_addr sim_gateway_of(sim *s, int node)
+{
+    pierce_addr g = s->nodes[node].priv;
+    g.addr[3] = 1;
+    g.port = 5351;
+    return g;
+}
+
+static void sim_route_out(sim *s, int node, const pierce_addr *src_priv, const pierce_addr *dst,
+                          const uint8_t *data, uint32_t len);
+static void sim_gateway(sim *s, int node, const pierce_addr *src_priv, const uint8_t *p, uint32_t len);
+
 /* Send from an internal endpoint (node priv address, or a server). */
 static void sim_route_out(sim *s, int node, const pierce_addr *src_priv, const pierce_addr *dst,
                           const uint8_t *data, uint32_t len)
 {
+    if (node >= 0 && s->nodes[node].nat >= 0 && s->nats[s->nodes[node].nat].pmp) {
+        pierce_addr gw = sim_gateway_of(s, node);
+        if (pc_addr_eq(dst, &gw)) {
+            sim_gateway(s, node, src_priv, data, len);   /* the router itself, on the LAN */
+            return;
+        }
+    }
     if (s->drop_all || (s->loss_ppm && sim_rand(s) % 1000000 < s->loss_ppm)) {
         s->dropped++;
         return;
     }
-    if (s->block_direct && node >= 0 && !(s->relay && pc_addr_eq(dst, &s->relay_addr)) &&
-        !(s->has_stun && pc_addr_eq(dst, &s->stun_addr))) {
+    if (s->block_direct && node >= 0 && !is_server(s, dst)) {
         s->dropped++;
         return;
     }
@@ -280,19 +351,85 @@ static void relay_send_cb(void *user, const pc_rs_ep *to, const uint8_t *data, s
     sim_route_out(s, -1, &s->relay_addr, &to->addr, data, (uint32_t)len);
 }
 
+/* A node owns its IP; port 5000 + k is its local endpoint k. */
 static int sim_node_by_priv(sim *s, const pierce_addr *a)
 {
     for (int i = 0; i < s->nnodes; i++)
-        if (pc_addr_eq(&s->nodes[i].priv, a)) return i;
+        if (pc_addr_ip_eq(&s->nodes[i].priv, a) && a->port >= 5000 && a->port < 5000 + 600) return i;
     return -1;
+}
+
+/* The router's answer to PCP / NAT-PMP: an "open" mapping for the
+   requesting endpoint. */
+static void sim_gateway(sim *s, int node, const pierce_addr *src_priv, const uint8_t *p, uint32_t len)
+{
+    sim_nat *n = &s->nats[s->nodes[node].nat];
+    pierce_addr gw = sim_gateway_of(s, node);
+    uint8_t r[64];
+    uint32_t rl = 0;
+    uint16_t want = 0, life = 0;
+    memset(r, 0, sizeof(r));
+    if (len >= 60 && p[0] == 2 && p[1] == 1) {                       /* PCP MAP */
+        if (n->pmp != PMP_PCP) {                                     /* NAT-PMP box: unsupported version */
+            r[0] = 0; r[1] = 0x81; r[3] = 1;
+            rl = 8;
+        } else {
+            want = pc_get16(p + 42);
+            life = (uint16_t)pc_get32(p + 4);
+            r[0] = 2; r[1] = 0x81; r[3] = 0;
+            pc_put32(r + 4, life);
+            memcpy(r + 24, p + 24, 12);                              /* nonce */
+            r[36] = 17;
+            pc_put16(r + 40, pc_get16(p + 40));
+            rl = 60;
+        }
+    } else if (len == 2 && p[0] == 0 && p[1] == 0 && n->pmp == PMP_NATPMP) {   /* external address */
+        r[1] = 128;
+        memcpy(r + 8, n->pmp_report_ip, 4);
+        rl = 12;
+    } else if (len == 12 && p[0] == 0 && p[1] == 1 && n->pmp == PMP_NATPMP) {  /* map UDP */
+        want = pc_get16(p + 6);
+        life = (uint16_t)pc_get32(p + 8);
+        r[1] = 129;
+        pc_put16(r + 8, pc_get16(p + 4));
+        rl = 16;
+    } else {
+        return;
+    }
+    if (want || rl == 16 || rl == 60) {
+        /* Create (or refresh) the open mapping for this endpoint. */
+        sim_map *m = NULL;
+        for (int i = 0; i < n->nmaps && !m; i++)
+            if (n->maps[i].open && pc_addr_eq(&n->maps[i].priv, src_priv)) m = &n->maps[i];
+        if (!m && life) {
+            m = nat_out(n, src_priv, &gw);   /* new entry; then make it open on the wanted port */
+            m->open = 1;
+            int taken = 0;
+            for (int i = 0; i < n->nmaps; i++) taken |= n->maps[i].pub_port == want && &n->maps[i] != m;
+            if (want && !taken) m->pub_port = want;
+        }
+        uint16_t ext = m ? m->pub_port : 0;
+        if (rl == 60) {
+            pc_put16(r + 42, ext);
+            r[54] = r[55] = 0xff;
+            memcpy(r + 56, n->pmp_report_ip, 4);
+        } else if (rl == 16) {
+            pc_put16(r + 10, ext);
+            pc_put32(r + 12, life);
+        }
+    }
+    /* The reply comes from the router on the LAN: no NAT in between. */
+    sim_enqueue(s, &gw, src_priv, r, rl, 0);
+    for (sim_pkt *q = s->q; q; q = q->next)
+        if (pc_addr_eq(&q->src, &gw) && pc_addr_eq(&q->dst, src_priv) && q->len == rl) q->lan = 1;
 }
 
 static void sim_deliver(sim *s, sim_pkt *p)
 {
-    if (s->has_stun && pc_addr_eq(&p->dst, &s->stun_addr)) {
+    if (s->has_stun && (pc_addr_eq(&p->dst, &s->stun_addr) || pc_addr_eq(&p->dst, &s->stun_addr2))) {
         uint8_t resp[64];
         size_t n = pc_stun_binding_response(resp, sizeof(resp), p->data, p->len, &p->src);
-        if (n && pc_get16(p->data) == 0x0001) sim_route_out(s, -1, &s->stun_addr, &p->src, resp, (uint32_t)n);
+        if (n && pc_get16(p->data) == 0x0001) sim_route_out(s, -1, &p->dst, &p->src, resp, (uint32_t)n);
         return;
     }
     if (s->relay && pc_addr_eq(&p->dst, &s->relay_addr)) {
@@ -305,6 +442,14 @@ static void sim_deliver(sim *s, sim_pkt *p)
     }
     int target = -1;
     pierce_addr src = p->src;
+    if (p->lan) {
+        target = sim_node_by_priv(s, &p->dst);
+        if (target < 0) return;
+        s->delivered++;
+        pierce__test_set_time(s->nodes[target].ctx, s->now);
+        pierce_transport_in_ex(s->nodes[target].ctx, (uint32_t)(p->dst.port - 5000), &src, p->data, p->len);
+        return;
+    }
     for (int i = 0; i < s->nnats && target < 0; i++) {
         sim_nat *n = &s->nats[i];
         if (memcmp(n->ip, p->dst.addr, 4) != 0) continue;
@@ -316,6 +461,7 @@ static void sim_deliver(sim *s, sim_pkt *p)
                 return;
             }
             target = sim_node_by_priv(s, &m->priv);
+            p->dst = m->priv;   /* translated destination: picks the local endpoint */
             break;
         }
         if (target < 0) {
@@ -333,7 +479,7 @@ static void sim_deliver(sim *s, sim_pkt *p)
     }
     s->delivered++;
     pierce__test_set_time(s->nodes[target].ctx, s->now);
-    pierce_transport_in(s->nodes[target].ctx, &src, p->data, p->len);
+    pierce_transport_in_ex(s->nodes[target].ctx, (uint32_t)(p->dst.port - 5000), &src, p->data, p->len);
 }
 
 /* ---- nodes ---- */
@@ -354,13 +500,15 @@ static int sim_add_node_cfg(sim *s, int nat, sim_cfg_fn fn, void *user)
     pierce_config cfg;
     pierce_config_init(&cfg);
     cfg.flags = PIERCE_CFG_NO_BUILTIN_UDP | PIERCE_CFG_NO_IPV6;
-    char stun[64], relay[64];
-    const char *stuns[1], *relays[1];
+    char stun[64], stun2[64], relay[64];
+    const char *stuns[2], *relays[1];
     if (s->has_stun) {
         pierce_addr_format(&s->stun_addr, stun, sizeof(stun));
+        pierce_addr_format(&s->stun_addr2, stun2, sizeof(stun2));
         stuns[0] = stun;
+        stuns[1] = stun2;
         cfg.stun_servers = stuns;
-        cfg.stun_server_count = 1;
+        cfg.stun_server_count = 2;
     }
     if (s->relay) {
         pierce_addr_format(&s->relay_addr, relay, sizeof(relay));
@@ -368,7 +516,7 @@ static int sim_add_node_cfg(sim *s, int nat, sim_cfg_fn fn, void *user)
         cfg.relay_servers = relays;
         cfg.relay_server_count = 1;
     }
-    cfg.log_level = s->verbose ? PIERCE_LOG_DEBUG : PIERCE_LOG_OFF;
+    cfg.log_level = s->verbose ? PIERCE_LOG_DEBUG : PIERCE_LOG_WARN;
     if (fn) fn(&cfg, user);
     int rc = pierce_ctx_create(&cfg, &n->ctx);
     if (rc != PIERCE_OK) {
@@ -377,6 +525,10 @@ static int sim_add_node_cfg(sim *s, int nat, sim_cfg_fn fn, void *user)
     }
     pierce__test_set_time(n->ctx, s->now);
     pierce_add_local_address(n->ctx, &n->priv);
+    if (nat >= 0 && s->nats[nat].pmp) {
+        pierce_addr gw = sim_gateway_of(s, i);
+        pierce__test_set_gateway(n->ctx, &gw);
+    }
     return i;
 }
 
@@ -413,10 +565,11 @@ static void sim_handle_event(sim *s, int idx, const pierce_event *ev)
     switch (ev->type) {
     case PIERCE_EV_TRANSMIT: {
         int is_relay = s->relay && pc_addr_eq(&ev->addr, &s->relay_addr);
-        int is_stun = s->has_stun && pc_addr_eq(&ev->addr, &s->stun_addr);
         if (is_relay) n->sent_relay++;
-        else if (!is_stun) n->sent_direct++;
-        sim_route_out(s, idx, &n->priv, &ev->addr, ev->data, ev->data_len);
+        else if (!is_server(s, &ev->addr)) n->sent_direct++;
+        pierce_addr from = n->priv;
+        from.port = (uint16_t)(5000 + ev->channel);   /* the local endpoint it names */
+        sim_route_out(s, idx, &from, &ev->addr, ev->data, ev->data_len);
         break;
     }
     case PIERCE_EV_SIGNAL_OUT:
@@ -464,6 +617,11 @@ static void sim_handle_event(sim *s, int idx, const pierce_event *ev)
         n->nmsgs++;
         break;
     case PIERCE_EV_LOG:
+        if (ev->flags <= PIERCE_LOG_WARN) {
+            uint32_t l = ev->data_len < sizeof(n->last_warn) - 1 ? ev->data_len : (uint32_t)sizeof(n->last_warn) - 1;
+            memcpy(n->last_warn, ev->data, l);
+            n->last_warn[l] = 0;
+        }
         if (s->verbose) fprintf(stderr, "[%8.3f node %d] %.*s\n", s->now / 1e6, idx, (int)ev->data_len, ev->data);
         break;
     }
@@ -579,6 +737,10 @@ static void sim_free(sim *s)
         free(g);
     }
     if (s->relay) pc_rs_destroy(s->relay);
+    for (int i = 0; i < s->nnats; i++) {
+        nat_clear(&s->nats[i]);
+        free(s->nats[i].maps);
+    }
 }
 
 #endif

@@ -133,6 +133,26 @@ static void rebuild_cands(pierce_ctx *ctx, int rescan)
             c.addr = r->reflexive;
             cand_list_add(nl, &n, &c);
         }
+        /* Router port mapping: open to anyone, so it goes first among the
+           public candidates. If STUN sees a different public IP, the router
+           is behind another NAT and the mapping is useless. */
+        pierce_addr mapped;
+        if (pc_portmap_advertised(ctx, &mapped)) {
+            int contradicted = 0;
+            for (uint32_t i = 0; i < ctx->nstun; i++)
+                if (ctx->stun[i].has_mapped && ctx->stun[i].mapped.family == PIERCE_AF_INET &&
+                    !pc_addr_ip_eq(&ctx->stun[i].mapped, &mapped))
+                    contradicted = 1;
+            if (contradicted) {
+                pc_portmap_reject(ctx);
+            } else {
+                memset(&c, 0, sizeof(c));
+                c.type = PC_CAND_SRFLX;
+                c.addr = mapped;
+                /* Replace a same-address STUN entry: the mapped port is the open one. */
+                cand_list_add(nl, &n, &c);
+            }
+        }
     }
     for (uint32_t i = 0; i < ctx->nrelays; i++) {
         pc_relay *r = ctx->relays[i];
@@ -191,6 +211,44 @@ static void stun_timers(pierce_ctx *ctx, uint64_t now, uint64_t *next)
     }
 }
 
+/* Compare what different STUN servers saw. The same public port for every
+   destination is an easy (endpoint-independent) mapping; differing ports
+   mean a symmetric NAT, which plain hole punching cannot traverse. */
+static void classify_nat(pierce_ctx *ctx)
+{
+    const pc_stun *first = NULL;
+    uint8_t cls = PC_NAT_UNKNOWN;
+    for (uint32_t i = 0; i < ctx->nstun; i++) {
+        const pc_stun *s = &ctx->stun[i];
+        if (!s->has_mapped || s->mapped.family != PIERCE_AF_INET) continue;
+        if (!first) {
+            first = s;
+            continue;
+        }
+        if (pc_addr_ip_eq(&first->addr, &s->addr)) continue;   /* same server: no information */
+        if (!pc_addr_eq(&first->mapped, &s->mapped)) {
+            cls = PC_NAT_HARD;
+            break;
+        }
+        cls = PC_NAT_EASY;
+    }
+    if (cls != ctx->nat_class && cls != PC_NAT_UNKNOWN) {
+        pc_log(ctx, PIERCE_LOG_INFO, "NAT mapping: %s",
+               cls == PC_NAT_HARD ? "symmetric (a different public port per destination)"
+                                  : "endpoint-independent (hole punching friendly)");
+        ctx->nat_class = cls;
+        pc_conn_cands_changed(ctx);   /* peers learn it from the next blob */
+    }
+}
+
+uint8_t pc_gather_sig_flags(pierce_ctx *ctx)
+{
+    pierce_addr m;
+    uint8_t f = ctx->nat_class & PC_SIG_FLAG_NAT_MASK;
+    if (pc_portmap_advertised(ctx, &m)) f |= PC_SIG_FLAG_MAPPED;
+    return f;
+}
+
 static int stun_input(pierce_ctx *ctx, const uint8_t *p, size_t len)
 {
     uint8_t txid[PC_STUN_TXID_LEN];
@@ -209,6 +267,7 @@ static int stun_input(pierce_ctx *ctx, const uint8_t *p, size_t len)
             pierce_addr_format(&mapped, a, sizeof(a));
             pc_log(ctx, PIERCE_LOG_DEBUG, "STUN mapped address %s", a);
             rebuild_cands(ctx, 0);
+            classify_nat(ctx);
         }
         break;
     }
@@ -498,6 +557,7 @@ int pc_gather_input(pierce_ctx *ctx, const pierce_addr *src, const uint8_t *data
             if (pc_addr_eq(&ctx->stun[i].addr, src)) return stun_input(ctx, data, len);
         return 1;   /* unsolicited STUN: ignore */
     }
+    if (pc_portmap_input(ctx, src, data, len)) return 1;
     if (data[0] < PC_RLY_ALLOC_REQ || data[0] > PC_RLY_FREE) return 0;
     for (uint32_t i = 0; i < ctx->nrelays; i++) {
         pc_relay *r = ctx->relays[i];
@@ -523,14 +583,26 @@ int pc_gather_init(pierce_ctx *ctx, const pierce_config *cfg)
     int tcp;
     uint64_t now = pc_now(ctx);
 
-    for (uint32_t i = 0; i < cfg->stun_server_count; i++) {
-        if (!cfg->stun_servers || !cfg->stun_servers[i]) return PIERCE_ERR_INVALID_ARG;
-        if (split_hostport(cfg->stun_servers[i], host, sizeof(host), &port, &tcp) < 0 || tcp)
+    /* With no STUN servers configured, use public ones (spec 5.5). Two
+       operators, so the results can also classify the NAT. */
+    static const char *const default_stun[] = {"stun.l.google.com:19302", "stun.cloudflare.com:3478"};
+    const char *const *stun = cfg->stun_servers;
+    uint32_t nstun = cfg->stun_server_count;
+    if (nstun == 0 && !(ctx->flags & (PIERCE_CFG_NO_DEFAULT_STUN | PIERCE_CFG_NO_BUILTIN_UDP))) {
+        stun = default_stun;
+        nstun = 2;
+    }
+    for (uint32_t i = 0; i < nstun; i++) {
+        if (!stun || !stun[i]) return PIERCE_ERR_INVALID_ARG;
+        if (split_hostport(stun[i], host, sizeof(host), &port, &tcp) < 0 || tcp)
             return PIERCE_ERR_INVALID_ARG;
         pierce_addr a[4];
         int n = resolve(host, port, a, 4);
         if (n <= 0) pc_log(ctx, PIERCE_LOG_WARN, "STUN server %s: cannot resolve", host);
+        /* One address per family per server keeps the request count small. */
+        int took4 = 0, took6 = 0;
         for (int k = 0; k < n && ctx->nstun < PC_MAX_STUN; k++) {
+            if ((a[k].family == PIERCE_AF_INET && took4++) || (a[k].family == PIERCE_AF_INET6 && took6++)) continue;
             if (!family_enabled(ctx, a[k].family)) continue;
             pc_stun *s = &ctx->stun[ctx->nstun++];
             memset(s, 0, sizeof(*s));
@@ -629,11 +701,14 @@ uint64_t pc_gather_next(pierce_ctx *ctx)
     for (uint32_t i = 0; i < ctx->nrelays; i++)
         if (ctx->relays[i]->next_tx_us != UINT64_MAX && (!t || ctx->relays[i]->next_tx_us < t))
             t = ctx->relays[i]->next_tx_us;
+    uint64_t p = pc_portmap_next(ctx);
+    if (p && (!t || p < t)) t = p;
     return t;
 }
 
 void pc_gather_timers(pierce_ctx *ctx, uint64_t now, uint64_t *next)
 {
     stun_timers(ctx, now, next);
+    pc_portmap_timers(ctx, now);
     relay_timers(ctx, now, next);
 }

@@ -424,6 +424,41 @@ int pal_resolve(const char *host, uint16_t port, pierce_addr *out, uint32_t cap)
     return (int)n;
 }
 
+/* ---- routing ---- */
+
+int pal_default_gateway(pierce_addr *out)
+{
+    MIB_IPFORWARDROW row;
+    /* The route the OS would use for a public address. */
+    DWORD probe = htonl(0x08080808u);
+    if (GetBestRoute(probe, 0, &row) != NO_ERROR || row.dwForwardNextHop == 0) return PIERCE_ERR_PLATFORM;
+    memset(out, 0, sizeof(*out));
+    out->family = PIERCE_AF_INET;
+    memcpy(out->addr, &row.dwForwardNextHop, 4);   /* network order */
+    return PIERCE_OK;
+}
+
+int pal_route_source(const pierce_addr *dst, pierce_addr *src)
+{
+    struct sockaddr_storage ss;
+    int sl = to_sockaddr(dst, &ss);
+    if (!sl) return PIERCE_ERR_INVALID_ARG;
+    SOCKET s = socket(dst->family == PIERCE_AF_INET6 ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return PIERCE_ERR_PLATFORM;
+    int rc = connect(s, (struct sockaddr *)&ss, sl) == 0 ? PIERCE_OK : PIERCE_ERR_PLATFORM;
+    if (rc == PIERCE_OK) {
+        int l = (int)sizeof(ss);
+        if (getsockname(s, (struct sockaddr *)&ss, &l) == 0) {
+            from_sockaddr((struct sockaddr *)&ss, src);
+            src->port = 0;
+        } else {
+            rc = PIERCE_ERR_PLATFORM;
+        }
+    }
+    closesocket(s);
+    return rc;
+}
+
 /* ---- mutex: SRWLOCK is a single pointer, stored in pal_mutex ---- */
 
 int pal_mutex_init(pal_mutex *m)

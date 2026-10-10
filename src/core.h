@@ -57,6 +57,7 @@ enum { PC_PATH_KIND_DIRECT = 1, PC_PATH_KIND_RELAY = 2 };
 
 typedef struct {
     uint8_t kind;
+    uint16_t local;                      /* direct: local socket, 0 = primary, n = xsocks[n-1] */
     pierce_addr remote;                  /* direct: peer address */
     uint32_t relay;                      /* relay: local relay index */
     uint8_t peer_relay_id[PC_RELAY_ID_LEN];
@@ -157,10 +158,11 @@ typedef struct {
     uint32_t tries;
     uint8_t validated;
     uint8_t rx_ok;                   /* a valid probe arrived from this path */
+    uint8_t dead;                    /* its extra socket was closed: never probe again */
     uint64_t rtt_us;
 } pc_pair;
 
-#define PC_MAX_PAIRS (PC_MAX_REMOTE_CANDS + 8)
+#define PC_MAX_PAIRS 600   /* candidate pairs plus birthday spray sockets */
 
 enum {
     PC_ST_SIGNALING = 1,  /* initiator: waiting for the answer */
@@ -196,13 +198,22 @@ typedef struct pc_conn {
     uint8_t probe_key[32];
     uint8_t has_probe_key;
     uint8_t sent_first_signal;
+    uint8_t flags_sent;              /* our PC_SIG_FLAG_* as last signaled */
+    uint8_t peer_flags;              /* the peer's, from its blobs */
     uint32_t cands_sent;             /* prefix of ctx->cands already signaled */
     uint32_t cands_epoch;
     pc_cand remote[PC_MAX_REMOTE_CANDS];
     uint32_t nremote;
-    pc_pair pairs[PC_MAX_PAIRS];
-    uint32_t npairs;
+    pc_pair *pairs;                  /* grows; never hold a pc_pair pointer across pair_add */
+    uint32_t npairs, cappairs;
     uint64_t probe_start_us;
+    /* birthday punching (spec 5.5) */
+    uint8_t bday_role;               /* 0 none, 1 spray (we are hard), 2 scan (we are easy) */
+    uint8_t bday_done;
+    uint64_t bday_start_us, bday_end_us;
+    uint32_t bday_sent;
+    pierce_addr bday_target;
+    uint8_t *bday_tried;             /* scan: 65536-bit map of probed ports */
     uint64_t deadline_us;            /* connect deadline; 0 = none yet */
 
     /* path */
@@ -330,6 +341,28 @@ typedef struct {
 #define PC_GEN_BITS 21
 #define PC_GEN_MAX ((1u << PC_GEN_BITS) - 1)
 
+/* ---- extra local sockets (birthday punching) ---- */
+#define PC_MAX_XSOCKS 512
+/* primary v4 + v6, wake, relay TCP, extra sockets, port-mapping TCP */
+#define PC_WAIT_SET_MAX (3 + PC_MAX_RELAYS + PC_MAX_XSOCKS + 1)
+
+typedef struct {
+    pal_sock sock;                   /* PAL_INVALID_SOCK in custom-transport mode */
+    struct pc_conn *owner;
+    uint8_t used;
+} pc_xsock;
+
+/* ---- NAT classification (signaled in blob flags, wire.md 2.2) ---- */
+enum {
+    PC_NAT_UNKNOWN = 0,
+    PC_NAT_EASY    = 1,   /* same public port for every destination */
+    PC_NAT_HARD    = 2    /* a different public port per destination (symmetric) */
+};
+#define PC_SIG_FLAG_NAT_MASK 0x03
+#define PC_SIG_FLAG_MAPPED   0x04   /* sender has a router port mapping: reachable by anyone */
+
+typedef struct pc_portmap pc_portmap;
+
 /* ---- gathering ---- */
 typedef struct {
     pierce_addr addr;
@@ -390,6 +423,8 @@ struct pierce_ctx {
     uint8_t manual_clock;            /* tests */
 
     /* sockets */
+    pc_xsock *xsocks;                /* PC_MAX_XSOCKS entries, allocated on first use */
+    uint32_t nxsocks_used;
     pal_sock sock4, sock6;
     uint16_t port4, port6;
     pal_wakeup wake;
@@ -417,6 +452,8 @@ struct pierce_ctx {
     uint32_t cands_epoch;
     pc_stun stun[PC_MAX_STUN];
     uint32_t nstun;
+    uint8_t nat_class;               /* PC_NAT_*: from comparing STUN results */
+    struct pc_portmap *pm;
     pc_relay *relays[PC_MAX_RELAYS];
     uint32_t nrelays;
 
@@ -459,6 +496,13 @@ void pc_emit(pc_conn *c, pc_event *ev);
 /* Sends a datagram on a path (direct socket or via relay). */
 void pc_send_path(pierce_ctx *ctx, const pc_path *path, const uint8_t *data, size_t len);
 void pc_send_direct(pierce_ctx *ctx, const pierce_addr *to, const uint8_t *data, size_t len);
+void pc_send_from(pierce_ctx *ctx, uint16_t local, const pierce_addr *to, const uint8_t *data, size_t len);
+/* Extra IPv4 sockets owned by a connection. Returns the local index (>= 1)
+   or 0 when none can be opened. */
+uint16_t pc_xsock_open(pierce_ctx *ctx, pc_conn *owner);
+void pc_xsock_close(pierce_ctx *ctx, uint16_t local);
+/* Close every extra socket of owner except keep (0 = close all). */
+void pc_xsock_release(pierce_ctx *ctx, pc_conn *owner, uint16_t keep);
 pc_conn *pc_conn_alloc(pierce_ctx *ctx, int initiator, const pierce_conn_options *opt);
 pc_conn *pc_conn_by_cid(pierce_ctx *ctx, const uint8_t cid[PC_CID_LEN]);
 pc_conn *pc_conn_by_session(pierce_ctx *ctx, const uint8_t session[PC_SESSION_LEN]);
@@ -487,6 +531,17 @@ void pc_gather_cands_rebuild(pierce_ctx *ctx);
 uint64_t pc_gather_next(pierce_ctx *ctx);
 int pc_gather_set_token(pierce_ctx *ctx, uint32_t index, const uint8_t *token, uint32_t len);
 void pc_input_packet(pierce_ctx *ctx, const pc_path *path, uint8_t *data, size_t len);
+uint8_t pc_gather_sig_flags(pierce_ctx *ctx);
+
+/* ---- portmap.c ---- */
+void pc_portmap_timers(pierce_ctx *ctx, uint64_t now);
+uint64_t pc_portmap_next(pierce_ctx *ctx);
+int pc_portmap_input(pierce_ctx *ctx, const pierce_addr *src, const uint8_t *p, size_t len);
+void pc_portmap_io(pierce_ctx *ctx);
+uint32_t pc_portmap_wait_set(pierce_ctx *ctx, pal_pollfd *fds, int32_t *tags);
+int pc_portmap_advertised(pierce_ctx *ctx, pierce_addr *out);
+void pc_portmap_reject(pierce_ctx *ctx);
+void pc_portmap_free(pierce_ctx *ctx);
 
 /* ---- conn.c ---- */
 int pc_conn_start_initiator(pc_conn *c, const pc_invite *inv, int have_invite);

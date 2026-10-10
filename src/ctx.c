@@ -63,7 +63,7 @@ int pierce_fingerprint(const uint8_t public_key[32], uint8_t out[32])
 int pc_path_eq(const pc_path *a, const pc_path *b)
 {
     if (a->kind != b->kind) return 0;
-    if (a->kind == PC_PATH_KIND_DIRECT) return pc_addr_eq(&a->remote, &b->remote);
+    if (a->kind == PC_PATH_KIND_DIRECT) return a->local == b->local && pc_addr_eq(&a->remote, &b->remote);
     return a->relay == b->relay && memcmp(a->peer_relay_id, b->peer_relay_id, PC_RELAY_ID_LEN) == 0;
 }
 
@@ -180,6 +180,12 @@ void pc_log(pierce_ctx *ctx, uint32_t level, const char *fmt, ...)
 
 void pc_send_direct(pierce_ctx *ctx, const pierce_addr *to, const uint8_t *data, size_t len)
 {
+    pc_send_from(ctx, 0, to, data, len);
+}
+
+void pc_send_from(pierce_ctx *ctx, uint16_t local, const pierce_addr *to, const uint8_t *data, size_t len)
+{
+    if (local && (!ctx->xsocks || local > PC_MAX_XSOCKS || !ctx->xsocks[local - 1].used)) return;
     if (ctx->flags & PIERCE_CFG_NO_BUILTIN_UDP) {
         pc_event *ev = pc_event_new(ctx, PIERCE_EV_TRANSMIT);
         if (!ev) return;
@@ -189,7 +195,12 @@ void pc_send_direct(pierce_ctx *ctx, const pierce_addr *to, const uint8_t *data,
             return;
         }
         ev->addr = *to;
+        ev->channel = local;   /* which local endpoint to send from */
         pc_emit_global(ctx, ev);
+        return;
+    }
+    if (local) {
+        if (to->family == PIERCE_AF_INET) pal_udp_send(ctx->xsocks[local - 1].sock, to, data, len);
         return;
     }
     pal_sock s = to->family == PIERCE_AF_INET6 ? ctx->sock6 : ctx->sock4;
@@ -200,7 +211,50 @@ void pc_send_direct(pierce_ctx *ctx, const pierce_addr *to, const uint8_t *data,
 void pc_send_path(pierce_ctx *ctx, const pc_path *path, const uint8_t *data, size_t len)
 {
     if (path->kind == PC_PATH_KIND_RELAY) pc_relay_send(ctx, path->relay, path->peer_relay_id, data, len);
-    else pc_send_direct(ctx, &path->remote, data, len);
+    else pc_send_from(ctx, path->local, &path->remote, data, len);
+}
+
+/* ---- extra sockets ---- */
+
+uint16_t pc_xsock_open(pierce_ctx *ctx, pc_conn *owner)
+{
+    if (!ctx->xsocks) {
+        ctx->xsocks = (pc_xsock *)pc_alloc(&ctx->alloc, PC_MAX_XSOCKS * sizeof(pc_xsock));
+        if (!ctx->xsocks) return 0;
+    }
+    if (ctx->flags & PIERCE_CFG_NO_IPV4) return 0;
+    for (uint32_t i = 0; i < PC_MAX_XSOCKS; i++) {
+        pc_xsock *x = &ctx->xsocks[i];
+        if (x->used) continue;
+        x->sock = PAL_INVALID_SOCK;
+        if (!(ctx->flags & PIERCE_CFG_NO_BUILTIN_UDP) && pal_udp_open(PIERCE_AF_INET, 0, &x->sock) != PIERCE_OK)
+            return 0;   /* out of descriptors: work with what we have */
+        x->used = 1;
+        x->owner = owner;
+        ctx->nxsocks_used++;
+        return (uint16_t)(i + 1);
+    }
+    return 0;
+}
+
+void pc_xsock_close(pierce_ctx *ctx, uint16_t local)
+{
+    if (!ctx->xsocks || local == 0 || local > PC_MAX_XSOCKS) return;
+    pc_xsock *x = &ctx->xsocks[local - 1];
+    if (!x->used) return;
+    pal_sock_close(x->sock);
+    x->sock = PAL_INVALID_SOCK;
+    x->used = 0;
+    x->owner = NULL;
+    ctx->nxsocks_used--;
+}
+
+void pc_xsock_release(pierce_ctx *ctx, pc_conn *owner, uint16_t keep)
+{
+    if (!ctx->xsocks) return;
+    for (uint32_t i = 0; i < PC_MAX_XSOCKS; i++)
+        if (ctx->xsocks[i].used && ctx->xsocks[i].owner == owner && i + 1 != keep)
+            pc_xsock_close(ctx, (uint16_t)(i + 1));
 }
 
 /* ===================================================================== */
@@ -406,6 +460,8 @@ static void conn_free(pierce_ctx *ctx, pc_conn *c)
     }
     if (c->peer_payload) pc_msg_unref(c->peer_payload);
     pc_free(&ctx->alloc, c->hs_payload);
+    pc_free(&ctx->alloc, c->pairs);
+    pc_xsock_release(ctx, c, 0);
     pc_noise_wipe(&c->hs);
 
     /* Spec 7.1: bump (here: clear) the generation under the slot lock, then
@@ -460,7 +516,7 @@ int pierce_ctx_create(const pierce_config *cfg, pierce_ctx **out)
     *out = NULL;
     if (cfg->struct_size < CFG_V1_MIN) return PIERCE_ERR_VERSION;
     if ((cfg->flags & PIERCE_CFG_NO_IPV4) && (cfg->flags & PIERCE_CFG_NO_IPV6)) return PIERCE_ERR_INVALID_ARG;
-    if (cfg->flags & ~0x1fu) return PIERCE_ERR_INVALID_ARG;
+    if (cfg->flags & ~0xffu) return PIERCE_ERR_INVALID_ARG;
     if (pal_init() != PIERCE_OK) return PIERCE_ERR_PLATFORM;
 
     pc_allocator_init(&a, cfg->allocator);
@@ -558,6 +614,7 @@ void pierce_ctx_destroy(pierce_ctx *ctx)
         pc_tr_send_close(c);
     }
     pc_gather_destroy_notify(ctx);
+    pc_portmap_free(ctx);
     while (ctx->conns) conn_free(ctx, ctx->conns);
     pc_event *ev;
     while ((ev = evq_pop(&ctx->global_q))) event_free(ctx, ev);
@@ -570,6 +627,10 @@ void pierce_ctx_destroy(pierce_ctx *ctx)
         pc_free(&a, ctx->slots);
     }
     pc_gather_free(ctx);
+    if (ctx->xsocks) {
+        for (uint32_t i = 0; i < PC_MAX_XSOCKS; i++) pc_xsock_close(ctx, (uint16_t)(i + 1));
+        pc_free(&a, ctx->xsocks);
+    }
     pal_sock_close(ctx->sock4);
     pal_sock_close(ctx->sock6);
     pal_wake_close(&ctx->wake);
@@ -879,7 +940,7 @@ void pc_input_packet(pierce_ctx *ctx, const pc_path *path, uint8_t *data, size_t
     }
 }
 
-static void input_datagram(pierce_ctx *ctx, const pierce_addr *src, uint8_t *data, size_t len)
+static void input_datagram(pierce_ctx *ctx, uint16_t local, const pierce_addr *src, uint8_t *data, size_t len)
 {
     uint32_t relay;
     const uint8_t *payload;
@@ -887,7 +948,8 @@ static void input_datagram(pierce_ctx *ctx, const pierce_addr *src, uint8_t *dat
     uint8_t peer_id[PC_RELAY_ID_LEN];
     pc_path path;
     if (len == 0 || len > PC_MTU + 32) return;
-    int r = pc_gather_input(ctx, src, data, len, &relay, &payload, &plen, peer_id);
+    /* Extra sockets only ever carry peer traffic. */
+    int r = local ? 0 : pc_gather_input(ctx, src, data, len, &relay, &payload, &plen, peer_id);
     if (r == 1) return;
     memset(&path, 0, sizeof(path));
     if (r == 2) {
@@ -898,17 +960,25 @@ static void input_datagram(pierce_ctx *ctx, const pierce_addr *src, uint8_t *dat
         return;
     }
     path.kind = PC_PATH_KIND_DIRECT;
+    path.local = local;
     path.remote = *src;
     pc_input_packet(ctx, &path, data, len);
 }
 
-int pierce_transport_in(pierce_ctx *ctx, const pierce_addr *src, const uint8_t *data, uint32_t len)
+int pierce_transport_in_ex(pierce_ctx *ctx, uint32_t local, const pierce_addr *src, const uint8_t *data,
+                           uint32_t len)
 {
     if (!ctx || !src || (len && !data)) return PIERCE_ERR_INVALID_ARG;
-    if (len > sizeof(ctx->rxbuf)) return PIERCE_ERR_INVALID_ARG;
+    if (len > sizeof(ctx->rxbuf) || local > PC_MAX_XSOCKS) return PIERCE_ERR_INVALID_ARG;
+    if (local && (!ctx->xsocks || !ctx->xsocks[local - 1].used)) return PIERCE_OK;   /* closed: drop */
     memcpy(ctx->rxbuf, data, len);
-    input_datagram(ctx, src, ctx->rxbuf, len);
+    input_datagram(ctx, (uint16_t)local, src, ctx->rxbuf, len);
     return PIERCE_OK;
+}
+
+int pierce_transport_in(pierce_ctx *ctx, const pierce_addr *src, const uint8_t *data, uint32_t len)
+{
+    return pierce_transport_in_ex(ctx, 0, src, data, len);
 }
 
 static void io_receive(pierce_ctx *ctx)
@@ -920,12 +990,23 @@ static void io_receive(pierce_ctx *ctx)
             pierce_addr from;
             int n = pal_udp_recv(socks[k], ctx->rxbuf, sizeof(ctx->rxbuf), &from);
             if (n < 0) break;
-            input_datagram(ctx, &from, ctx->rxbuf, (size_t)n);
+            input_datagram(ctx, 0, &from, ctx->rxbuf, (size_t)n);
+        }
+    }
+    for (uint32_t i = 0; ctx->nxsocks_used && i < PC_MAX_XSOCKS; i++) {
+        if (!ctx->xsocks[i].used || ctx->xsocks[i].sock == PAL_INVALID_SOCK) continue;
+        for (int k = 0; k < 16; k++) {
+            pierce_addr from;
+            int n = pal_udp_recv(ctx->xsocks[i].sock, ctx->rxbuf, sizeof(ctx->rxbuf), &from);
+            if (n < 0) break;
+            input_datagram(ctx, (uint16_t)(i + 1), &from, ctx->rxbuf, (size_t)n);
+            if (!ctx->xsocks[i].used) break;   /* closed while handling */
         }
     }
     for (uint32_t i = 0; i < ctx->nrelays; i++)
         if (ctx->relays[i]->tcp && ctx->relays[i]->sock != PAL_INVALID_SOCK)
             pc_relay_tcp_io(ctx, i, 1, 1, 0);
+    pc_portmap_io(ctx);
 }
 
 /* ===================================================================== */
@@ -1101,6 +1182,13 @@ static void build_wait_set(pierce_ctx *ctx, pal_pollfd *fds, uint32_t *n, int32_
         fds[*n].want_write = (uint8_t)(r->state == PC_RELAY_CONNECTING || r->txlen > 0);
         relay_idx[(*n)++] = (int32_t)i;
     }
+    for (uint32_t i = 0; ctx->nxsocks_used && i < PC_MAX_XSOCKS; i++) {
+        if (!ctx->xsocks[i].used || ctx->xsocks[i].sock == PAL_INVALID_SOCK) continue;
+        fds[*n].sock = ctx->xsocks[i].sock;
+        fds[*n].want_write = 0;
+        relay_idx[(*n)++] = -1;
+    }
+    *n += pc_portmap_wait_set(ctx, fds + *n, relay_idx + *n);
 }
 
 int pierce_poll(pierce_ctx *ctx, pierce_event *out, uint32_t max, int32_t timeout_ms)
@@ -1143,8 +1231,8 @@ int pierce_poll(pierce_ctx *ctx, pierce_event *out, uint32_t max, int32_t timeou
             if (wait_us < 0 || left < wait_us) wait_us = left;
         }
         int32_t wait_ms = wait_us < 0 ? -1 : (int32_t)((wait_us + 999) / 1000);
-        pal_pollfd fds[2 + 1 + PC_MAX_RELAYS];
-        int32_t ridx[2 + 1 + PC_MAX_RELAYS];
+        pal_pollfd fds[PC_WAIT_SET_MAX];
+        int32_t ridx[PC_WAIT_SET_MAX];
         uint32_t nf;
         build_wait_set(ctx, fds, &nf, ridx);
         int r = pal_wait(fds, nf, wait_ms);
@@ -1155,9 +1243,11 @@ int pierce_poll(pierce_ctx *ctx, pierce_event *out, uint32_t max, int32_t timeou
         /* pierce_wake (not the internal wake from pierce_send) ends a
            blocking poll after one more processing pass. */
         if (pal_atomic_exchange(&ctx->app_wake, 0)) timeout_ms = 0;
-        for (uint32_t i = 0; i < nf; i++)
-            if (ridx[i] >= 0 && (fds[i].readable || fds[i].writable || fds[i].failed))
-                pc_relay_tcp_io(ctx, (uint32_t)ridx[i], fds[i].readable, fds[i].writable, fds[i].failed);
+        for (uint32_t i = 0; i < nf; i++) {
+            if (!(fds[i].readable || fds[i].writable || fds[i].failed)) continue;
+            if (ridx[i] >= 0) pc_relay_tcp_io(ctx, (uint32_t)ridx[i], fds[i].readable, fds[i].writable, fds[i].failed);
+            else if (ridx[i] == -3) pc_portmap_io(ctx);
+        }
     }
     ctx->in_poll = 0;
     return n;
@@ -1280,13 +1370,10 @@ void pierce_resume(pierce_ctx *ctx)
 int pierce_get_fds(pierce_ctx *ctx, pierce_socket *fds, uint32_t cap)
 {
     if (!ctx || (cap && !fds)) return PIERCE_ERR_INVALID_ARG;
-    pierce_socket all[2 + 1 + PC_MAX_RELAYS];
-    uint32_t n = 0;
-    if (ctx->sock4 != PAL_INVALID_SOCK) all[n++] = ctx->sock4;
-    if (ctx->sock6 != PAL_INVALID_SOCK) all[n++] = ctx->sock6;
-    all[n++] = ctx->wake.rd;
-    for (uint32_t i = 0; i < ctx->nrelays; i++)
-        if (ctx->relays[i]->tcp && ctx->relays[i]->sock != PAL_INVALID_SOCK) all[n++] = ctx->relays[i]->sock;
-    for (uint32_t i = 0; i < n && i < cap; i++) fds[i] = all[i];
+    pal_pollfd all[PC_WAIT_SET_MAX];
+    int32_t idx[PC_WAIT_SET_MAX];
+    uint32_t n;
+    build_wait_set(ctx, all, &n, idx);
+    for (uint32_t i = 0; i < n && i < cap; i++) fds[i] = all[i].sock;
     return (int)n;
 }

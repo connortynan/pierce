@@ -11,6 +11,15 @@
 #define RATE_BURST 20
 #define RATE_PER_SEC 10
 
+/* Birthday punching: the hard side opens BDAY_SOCKETS mappings, the easy
+   side probes random ports. P(hit) per probe ~ BDAY_SOCKETS / 64512; with
+   2048 probes that is ~1 - e^-8 > 99.9% (fewer sockets: still ~98% at 128). */
+#define BDAY_DELAY_US 1000000        /* give ordinary punching a head start */
+#define BDAY_WINDOW_US 10000000
+#define BDAY_SOCKETS 256
+#define BDAY_SCAN_MAX 2048
+#define BDAY_SCAN_INTERVAL_US 4000   /* 250 probes per second */
+
 static const uint8_t zero_session[PC_SESSION_LEN];
 
 static uint64_t backoff(uint64_t base, uint32_t tries, uint64_t cap)
@@ -28,6 +37,9 @@ static void finish(pc_conn *c, int32_t error)
     pierce_ctx *ctx = c->ctx;
     if (c->state == PC_ST_CLOSED) return;
     c->state = PC_ST_CLOSED;
+    pc_free(&ctx->alloc, c->bday_tried);
+    c->bday_tried = NULL;
+    pc_xsock_release(ctx, c, 0);
     pc_slot_close(c);
     pc_tr_free(c);
     pc_noise_wipe(&c->hs);
@@ -74,12 +86,14 @@ static void emit_signal(pc_conn *c, uint8_t kind)
     memcpy(s.session, c->session, PC_SESSION_LEN);
     memcpy(s.secret, c->my_secret, 32);
     if (kind == PC_SIG_OFFER && c->has_peer_key) memcpy(s.host_hint, c->peer_key, 8);
+    s.flags = pc_gather_sig_flags(ctx);
     uint32_t from = (kind == PC_SIG_CANDIDATES && c->cands_epoch == ctx->cands_epoch) ? c->cands_sent : 0;
     for (uint32_t i = from; i < ctx->ncands && s.ncand < PC_MAX_BLOB_CANDS; i++)
         s.cands[s.ncand++] = ctx->cands[i];
     c->cands_sent = ctx->ncands;
     c->cands_epoch = ctx->cands_epoch;
-    if (kind == PC_SIG_CANDIDATES && s.ncand == 0) return;
+    if (kind == PC_SIG_CANDIDATES && s.ncand == 0 && s.flags == c->flags_sent) return;
+    c->flags_sent = s.flags;
     int n = pc_signal_encode(&s, buf, sizeof(buf));
     if (n < 0) return;
     pc_event *ev = pc_event_new(ctx, PIERCE_EV_SIGNAL_OUT);
@@ -119,6 +133,15 @@ static pc_pair *pair_add(pc_conn *c, const pc_path *p, uint32_t remote_index)
     pc_pair *pr = pair_find(c, p);
     if (pr) return pr;
     if (c->npairs >= PC_MAX_PAIRS) return NULL;
+    if (c->npairs == c->cappairs) {
+        uint32_t nc = c->cappairs ? c->cappairs * 2 : 16;
+        if (nc > PC_MAX_PAIRS) nc = PC_MAX_PAIRS;
+        pc_pair *n = (pc_pair *)pc_realloc(&c->ctx->alloc, c->pairs, c->cappairs * sizeof(pc_pair),
+                                           nc * sizeof(pc_pair));
+        if (!n) return NULL;
+        c->pairs = n;
+        c->cappairs = nc;
+    }
     pr = &c->pairs[c->npairs++];
     memset(pr, 0, sizeof(*pr));
     pr->path = *p;
@@ -191,6 +214,7 @@ int pc_conn_signal_in(pierce_ctx *ctx, const pc_signal *s, pc_conn **out)
 {
     pc_conn *c = pc_conn_by_session(ctx, s->session);
     *out = NULL;
+    if (c) c->peer_flags = s->flags;
     switch (s->kind) {
     case PC_SIG_OFFER: {
         if (c) {                                 /* duplicate offer */
@@ -207,6 +231,7 @@ int pc_conn_signal_in(pierce_ctx *ctx, const pc_signal *s, pc_conn **out)
         if (!c) return PIERCE_ERR_NO_MEMORY;
         memcpy(c->session, s->session, PC_SESSION_LEN);
         c->has_session = 1;
+        c->peer_flags = s->flags;
         memcpy(c->peer_secret, s->secret, 32);
         c->has_peer_secret = 1;
         pc_random(c->my_secret, 32);
@@ -249,7 +274,8 @@ void pc_conn_cands_changed(pierce_ctx *ctx)
         if (c->has_probe_key) pairs_refresh(c);
         if (!c->has_session || !c->sent_first_signal) continue;
         if (c->state > PC_ST_HANDSHAKE) continue;
-        if (c->cands_epoch != ctx->cands_epoch || ctx->ncands > c->cands_sent)
+        if (c->cands_epoch != ctx->cands_epoch || ctx->ncands > c->cands_sent ||
+            pc_gather_sig_flags(ctx) != c->flags_sent)
             emit_signal(c, PC_SIG_CANDIDATES);
     }
 }
@@ -280,7 +306,7 @@ static void probe_pairs(pc_conn *c, uint64_t now, int direct_only)
 {
     for (uint32_t i = 0; i < c->npairs; i++) {
         pc_pair *pr = &c->pairs[i];
-        if (pr->validated) continue;
+        if (pr->validated || pr->dead) continue;
         if (direct_only && pr->path.kind != PC_PATH_KIND_DIRECT) continue;
         if (now >= pr->next_tx_us) send_probe(c, pr, now);
     }
@@ -291,9 +317,170 @@ static uint64_t probe_next(pc_conn *c, int direct_only)
     uint64_t t = 0;
     for (uint32_t i = 0; i < c->npairs; i++) {
         pc_pair *pr = &c->pairs[i];
-        if (pr->validated) continue;
+        if (pr->validated || pr->dead) continue;
         if (direct_only && pr->path.kind != PC_PATH_KIND_DIRECT) continue;
         if (!t || pr->next_tx_us < t) t = pr->next_tx_us;
+    }
+    return t;
+}
+
+/* ===================================================================== */
+/* Birthday punching                                                     */
+/* ===================================================================== */
+
+static void bday_txid(const pc_conn *c, uint16_t port, uint8_t out[PC_TXID_LEN])
+{
+    uint8_t in[6] = {'b', 'd', 'a', 'y', (uint8_t)(port >> 8), (uint8_t)port};
+    uint8_t mac[16];
+    pc_mac16(mac, c->probe_key, 32, in, sizeof(in));
+    memcpy(out, mac, PC_TXID_LEN);
+}
+
+/* Stop: close every extra socket except the one the connection uses. */
+static void bday_finish(pc_conn *c)
+{
+    if (!c->bday_role || c->bday_done) return;
+    c->bday_done = 1;
+    uint16_t keep = c->has_path && c->path.kind == PC_PATH_KIND_DIRECT ? c->path.local : 0;
+    pc_xsock_release(c->ctx, c, keep);
+    for (uint32_t i = 0; i < c->npairs; i++)
+        if (c->pairs[i].path.kind == PC_PATH_KIND_DIRECT && c->pairs[i].path.local &&
+            c->pairs[i].path.local != keep)
+            c->pairs[i].dead = 1;
+    pc_free(&c->ctx->alloc, c->bday_tried);
+    c->bday_tried = NULL;
+    int won = keep || (c->has_path && c->path.kind == PC_PATH_KIND_DIRECT);
+    if (c->bday_role == 2)
+        pc_log(c->ctx, PIERCE_LOG_DEBUG, "conn %llu: birthday punching %s after %u probes",
+               (unsigned long long)c->id, won ? "succeeded" : "gave up", c->bday_sent);
+    else
+        pc_log(c->ctx, PIERCE_LOG_DEBUG, "conn %llu: birthday punching %s; extra sockets closed",
+               (unsigned long long)c->id, won ? "succeeded" : "gave up");
+}
+
+static const pc_cand *peer_srflx4(const pc_conn *c)
+{
+    for (uint32_t i = 0; i < c->nremote; i++)
+        if (c->remote[i].type == PC_CAND_SRFLX && c->remote[i].addr.family == PIERCE_AF_INET) return &c->remote[i];
+    return NULL;
+}
+
+static int direct_validated(const pc_conn *c)
+{
+    for (uint32_t i = 0; i < c->npairs; i++)
+        if (c->pairs[i].validated && c->pairs[i].path.kind == PC_PATH_KIND_DIRECT) return 1;
+    return 0;
+}
+
+/* Decide once, a moment into probing, whether this pair needs it. */
+static void bday_maybe_start(pc_conn *c, uint64_t now)
+{
+    pierce_ctx *ctx = c->ctx;
+    if (c->bday_role || !c->has_probe_key || !c->probe_start_us) return;
+    if (now < c->probe_start_us + BDAY_DELAY_US) return;
+    if (ctx->flags & (PIERCE_CFG_NO_BIRTHDAY | PIERCE_CFG_RELAY_ONLY | PIERCE_CFG_NO_IPV4)) return;
+    if (direct_validated(c)) return;
+    uint8_t mine = ctx->nat_class, theirs = c->peer_flags & PC_SIG_FLAG_NAT_MASK;
+    if ((pc_gather_sig_flags(ctx) | c->peer_flags) & PC_SIG_FLAG_MAPPED) return;   /* a mapping beats guessing */
+    const pc_cand *target = peer_srflx4(c);
+    if (!target) return;
+    uint8_t role = mine == PC_NAT_HARD && theirs == PC_NAT_EASY ? 1 : mine == PC_NAT_EASY && theirs == PC_NAT_HARD ? 2 : 0;
+    if (!role) return;
+    c->bday_role = role;
+    c->bday_start_us = now;
+    c->bday_end_us = now + BDAY_WINDOW_US;
+    c->bday_target = target->addr;
+    if (role == 1) {
+        /* Spray: many sockets, each a new mapping on our symmetric NAT,
+           all aimed at the peer's (stable) public address. */
+        int opened = 0;
+        for (int i = 0; i < BDAY_SOCKETS; i++) {
+            uint16_t local = pc_xsock_open(ctx, c);
+            if (!local) break;
+            pc_path p;
+            memset(&p, 0, sizeof(p));
+            p.kind = PC_PATH_KIND_DIRECT;
+            p.local = local;
+            p.remote = target->addr;
+            if (!pair_add(c, &p, (uint32_t)(target - c->remote))) {
+                pc_xsock_close(ctx, local);
+                break;
+            }
+            opened++;
+        }
+        pc_log(ctx, PIERCE_LOG_INFO, "conn %llu: peer behind an easy NAT, we are symmetric: birthday punching from %d sockets",
+               (unsigned long long)c->id, opened);
+        if (!opened) c->bday_done = 1;
+    } else {
+        c->bday_tried = (uint8_t *)pc_alloc(&ctx->alloc, 65536 / 8);
+        if (!c->bday_tried) {
+            c->bday_done = 1;
+            return;
+        }
+        pc_log(ctx, PIERCE_LOG_INFO, "conn %llu: peer behind a symmetric NAT: birthday punching its ports",
+               (unsigned long long)c->id);
+    }
+}
+
+static void bday_scan(pc_conn *c, uint64_t now)
+{
+    uint32_t due = (uint32_t)((now - c->bday_start_us) / BDAY_SCAN_INTERVAL_US) + 1;
+    if (due > BDAY_SCAN_MAX) due = BDAY_SCAN_MAX;
+    for (int burst = 0; c->bday_sent < due && burst < 32; burst++) {
+        uint16_t port;
+        do {
+            port = (uint16_t)(1024 + pc_random_u64() % (65536 - 1024));
+        } while (c->bday_tried[port / 8] & (1u << (port % 8)));
+        c->bday_tried[port / 8] |= (uint8_t)(1u << (port % 8));
+        uint8_t p[PC_PROBE_LEN];
+        p[0] = PC_PKT_PROBE;
+        memcpy(p + 1, c->session, PC_SESSION_LEN);
+        bday_txid(c, port, p + 1 + PC_SESSION_LEN);
+        p[1 + PC_SESSION_LEN + PC_TXID_LEN] = c->initiator ? 1 : 0;
+        pc_mac16(p + PC_PROBE_LEN - 16, c->probe_key, 32, p, PC_PROBE_LEN - 16);
+        pierce_addr to = c->bday_target;
+        to.port = port;
+        pc_send_direct(c->ctx, &to, p, sizeof(p));
+        c->bday_sent++;
+    }
+}
+
+static void bday_timers(pc_conn *c, uint64_t now)
+{
+    if (c->state < PC_ST_PROBING || c->state == PC_ST_CLOSED) return;
+    if (!c->bday_role) {
+        if (c->state == PC_ST_PROBING || (c->has_path && c->path.kind == PC_PATH_KIND_RELAY))
+            bday_maybe_start(c, now);
+        return;
+    }
+    if (c->bday_done) return;
+    /* Done once a direct path is in use, or when the window closes. */
+    int direct_in_use = c->has_path && c->path.kind == PC_PATH_KIND_DIRECT && c->state >= PC_ST_AWAIT_APP;
+    if (direct_in_use || now >= c->bday_end_us) {
+        bday_finish(c);
+        return;
+    }
+    if (c->bday_role == 2 && c->bday_sent < BDAY_SCAN_MAX && !direct_validated(c)) bday_scan(c, now);
+}
+
+static uint64_t bday_next(const pc_conn *c)
+{
+    if (c->state < PC_ST_PROBING || c->state == PC_ST_CLOSED) return 0;
+    if (!c->bday_role) {
+        if (!c->probe_start_us || c->bday_done) return 0;
+        if (c->state != PC_ST_PROBING && !(c->has_path && c->path.kind == PC_PATH_KIND_RELAY)) return 0;
+        uint64_t t = c->probe_start_us + BDAY_DELAY_US;
+        return t < c->probe_start_us + c->ctx->connect_us ? t : 0;
+    }
+    if (c->bday_done) return 0;
+    uint64_t t = c->bday_end_us;
+    if (c->bday_role == 2 && c->bday_sent < BDAY_SCAN_MAX) {
+        uint64_t s = c->bday_start_us + (uint64_t)c->bday_sent * BDAY_SCAN_INTERVAL_US;
+        if (s < t) t = s;
+    }
+    if (c->bday_role == 1 || c->state >= PC_ST_AWAIT_APP) {
+        /* Release sockets promptly once connected. */
+        if (c->has_path && c->path.kind == PC_PATH_KIND_DIRECT && c->state >= PC_ST_AWAIT_APP) t = pc_now(c->ctx);
     }
     return t;
 }
@@ -379,10 +566,29 @@ void pc_conn_input_probe(pierce_ctx *ctx, const pc_path *path, const uint8_t *p,
                     sent = pr->tx_us[k];
                     break;
                 }
+        if (!pr && c->bday_role == 2 && path->kind == PC_PATH_KIND_DIRECT && path->local == 0 &&
+            pc_addr_ip_eq(&path->remote, &c->bday_target)) {
+            /* A scan probe found one of the peer's mappings: the txid is a
+               MAC of the port we probed, so it vouches for this source. */
+            uint8_t want[PC_TXID_LEN];
+            bday_txid(c, path->remote.port, want);
+            if (memcmp(want, txid, PC_TXID_LEN) != 0) return;
+            pc_cand cand;
+            memset(&cand, 0, sizeof(cand));
+            cand.type = PC_CAND_PRFLX;
+            cand.addr = path->remote;
+            int idx = remote_add(c, &cand);
+            if (idx < 0) return;
+            pr = pair_add(c, path, (uint32_t)idx);
+            if (!pr) return;
+            sent = 0;
+            pc_log(ctx, PIERCE_LOG_DEBUG, "conn %llu: birthday hit after %u probes", (unsigned long long)c->id,
+                   c->bday_sent);
+        }
         /* The ack must come back over the path the probe went out on. */
-        if (!pr || !pc_path_eq(&pr->path, path) || pr->validated) return;
+        if (!pr || !pc_path_eq(&pr->path, path) || pr->validated || pr->dead) return;
         pr->validated = 1;
-        pr->rtt_us = now - sent;
+        pr->rtt_us = sent ? now - sent : 0;
         if (!c->initiator) return;
         if (c->state == PC_ST_PROBING) {
             select_path(c, pr, now);
@@ -980,6 +1186,7 @@ uint64_t pc_conn_next_timer(pc_conn *c)
             TMIN(PC_MAX(c->last_eliciting_tx_us, c->last_rx_us) + ctx->keepalive_us);
     }
     if (c->state != PC_ST_PROBING && upgrade_probing(c)) TMIN(probe_next(c, 1));
+    TMIN(bday_next(c));
 #undef TMIN
     return t;
 }
@@ -992,7 +1199,21 @@ void pc_conn_timers(pc_conn *c, uint64_t now)
     if (c->state != PC_ST_CONNECTED && c->deadline_us && now >= c->deadline_us) {
         switch (c->state) {
         case PC_ST_PROBING:
-            pc_log(ctx, PIERCE_LOG_INFO, "conn %llu: no path found", (unsigned long long)c->id);
+            {
+                /* Say why, in terms an app can show a user. */
+                uint8_t mine = ctx->nat_class, theirs = c->peer_flags & PC_SIG_FLAG_NAT_MASK;
+                const char *why;
+                if (mine == PC_NAT_HARD && theirs == PC_NAT_HARD)
+                    why = "both sides are behind symmetric NATs, which only a relay (or IPv6) can bridge";
+                else if (mine == PC_NAT_HARD || theirs == PC_NAT_HARD)
+                    why = "one side is behind a symmetric NAT and birthday punching did not get through";
+                else if (!c->nremote)
+                    why = "no candidates arrived from the peer (check the signaling)";
+                else
+                    why = "the networks block the direct paths tried (firewall, UDP filtering)";
+                pc_log(ctx, PIERCE_LOG_WARN, "conn %llu: no path found: %s%s", (unsigned long long)c->id, why,
+                       ctx->nrelays ? "" : "; no relay is configured");
+            }
             finish(c, PIERCE_ERR_UNREACHABLE);
             return;
         case PC_ST_AWAIT_APP:
@@ -1037,4 +1258,5 @@ void pc_conn_timers(pc_conn *c, uint64_t now)
             c->ping_pending = 1;
     }
     if (c->state != PC_ST_PROBING && upgrade_probing(c)) probe_pairs(c, now, 1);
+    bday_timers(c, now);
 }

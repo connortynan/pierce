@@ -30,6 +30,10 @@
 #include <sys/eventfd.h>
 #include <sys/random.h>
 #endif
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <net/route.h>
+#include <sys/sysctl.h>
+#endif
 
 int pal_init(void) { return PIERCE_OK; }
 void pal_shutdown(void) {}
@@ -415,6 +419,97 @@ int pal_resolve(const char *host, uint16_t port, pierce_addr *out, uint32_t cap)
     }
     freeaddrinfo(res);
     return (int)n;
+}
+
+/* ---- routing ---- */
+
+#if defined(__linux__)
+int pal_default_gateway(pierce_addr *out)
+{
+    char line[256];
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) return PIERCE_ERR_PLATFORM;
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f)) {
+        char ifname[64];
+        unsigned dst, gw, flags;
+        if (sscanf(line, "%63s %x %x %x", ifname, &dst, &gw, &flags) != 4) continue;
+        if (dst != 0 || !(flags & 0x2) || gw == 0) continue;   /* RTF_GATEWAY */
+        memset(out, 0, sizeof(*out));
+        out->family = PIERCE_AF_INET;
+        memcpy(out->addr, &gw, 4);   /* the kernel prints network order as host-endian hex */
+        found = 1;
+    }
+    fclose(f);
+    return found ? PIERCE_OK : PIERCE_ERR_PLATFORM;
+}
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(__APPLE__)
+#define RT_ROUNDUP(a) ((a) > 0 ? (1 + (((a) - 1) | (sizeof(uint32_t) - 1))) : sizeof(uint32_t))
+#else
+#define RT_ROUNDUP(a) ((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+#endif
+int pal_default_gateway(pierce_addr *out)
+{
+    int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_GATEWAY};
+    size_t len = 0;
+    if (sysctl(mib, 6, NULL, &len, NULL, 0) < 0 || len == 0) return PIERCE_ERR_PLATFORM;
+    char *buf = (char *)malloc(len);
+    if (!buf) return PIERCE_ERR_NO_MEMORY;
+    if (sysctl(mib, 6, buf, &len, NULL, 0) < 0) {
+        free(buf);
+        return PIERCE_ERR_PLATFORM;
+    }
+    int found = 0;
+    for (char *p = buf; !found && p + sizeof(struct rt_msghdr) <= buf + len;) {
+        struct rt_msghdr *rtm = (struct rt_msghdr *)p;
+        if (rtm->rtm_msglen == 0) break;
+        struct sockaddr *sa = (struct sockaddr *)(rtm + 1), *dst = NULL, *gw = NULL;
+        for (int i = 0; i < RTAX_MAX; i++) {
+            if (!(rtm->rtm_addrs & (1 << i))) continue;
+            if (i == RTAX_DST) dst = sa;
+            if (i == RTAX_GATEWAY) gw = sa;
+            sa = (struct sockaddr *)((char *)sa + RT_ROUNDUP(sa->sa_len));
+        }
+        if (dst && gw && dst->sa_family == AF_INET && gw->sa_family == AF_INET &&
+            ((struct sockaddr_in *)dst)->sin_addr.s_addr == 0) {
+            from_sockaddr(gw, out);
+            out->port = 0;
+            found = 1;
+        }
+        p += rtm->rtm_msglen;
+    }
+    free(buf);
+    return found ? PIERCE_OK : PIERCE_ERR_PLATFORM;
+}
+#else
+int pal_default_gateway(pierce_addr *out)
+{
+    (void)out;
+    return PIERCE_ERR_NOT_SUPPORTED;
+}
+#endif
+
+int pal_route_source(const pierce_addr *dst, pierce_addr *src)
+{
+    struct sockaddr_storage ss;
+    socklen_t sl = to_sockaddr(dst, &ss);
+    if (!sl) return PIERCE_ERR_INVALID_ARG;
+    int fd = socket(dst->family == PIERCE_AF_INET6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return PIERCE_ERR_PLATFORM;
+    /* connect() on UDP sends nothing; it only asks the kernel for a route. */
+    int rc = connect(fd, (struct sockaddr *)&ss, sl) == 0 ? PIERCE_OK : PIERCE_ERR_PLATFORM;
+    if (rc == PIERCE_OK) {
+        sl = sizeof(ss);
+        if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
+            from_sockaddr((struct sockaddr *)&ss, src);
+            src->port = 0;
+        } else {
+            rc = PIERCE_ERR_PLATFORM;
+        }
+    }
+    close(fd);
+    return rc;
 }
 
 /* ---- mutex ---- */

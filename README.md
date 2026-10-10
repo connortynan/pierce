@@ -9,9 +9,13 @@ punching first, relay fallback second, dedicated servers on the same API.
 - **Channels.** Reliable ordered, reliable unordered, sequenced (newest
   wins) and unreliable, with priorities, lifetimes, retransmit limits and
   fragmentation, over one congestion-controlled connection (NewReno).
-- **Traversal.** Host, STUN-reflexive, peer-reflexive and relay candidates,
-  trickled over a signaling channel you provide (anything that carries a
-  few hundred bytes). Relay paths upgrade to direct ones when possible.
+- **Connects whenever anything can, with zero configuration.** Every
+  technique is on by default: LAN, IPv6, STUN hole punching with built-in
+  public STUN servers, router port mapping (PCP, NAT-PMP, UPnP),
+  birthday-paradox punching for symmetric NATs, and relays over UDP or
+  TCP/443. Relay paths upgrade to direct ones when possible, and failures
+  come with a plain-language reason. Opt-out flags exist; nothing needs
+  turning on. See spec section 5.5.
 - **One event loop.** No callbacks out, no library threads. `pierce_send` is
   thread-safe; everything else belongs to the thread that polls.
 - **Small.** One dependency, [Monocypher](https://monocypher.org) (X25519,
@@ -87,6 +91,18 @@ Examples:
 - [examples/tofu_chat.c](examples/tofu_chat.c): peer-to-peer chat with
   copy-paste signaling and trust-on-first-use identities.
 
+## Privacy and network behaviour
+
+Out of the box a context:
+- sends small STUN requests to Google and Cloudflare;
+- asks the local router for a 2-hour UDP port mapping;
+- during a difficult connection, may send a short burst of probes (up to a
+  few thousand over a few seconds) to the peer.
+
+Use `PIERCE_CFG_NO_DEFAULT_STUN`, `PIERCE_CFG_NO_PORT_MAPPING` and
+`PIERCE_CFG_NO_BIRTHDAY` to turn these off, and `PIERCE_CFG_RELAY_ONLY` to
+reveal no addresses to peers at all.
+
 ## Relay
 
 ```sh
@@ -106,8 +122,14 @@ Clients list it as `"relay.example.com:3478"` (UDP) or
 - `test_sim`: a deterministic in-process network with a full-cone,
   restricted, port-restricted and symmetric NAT matrix, loss, reordering,
   duplication, migration, rekeying, 200-client fan-in, and fuzzing.
-- `test_udp`: real sockets on loopback, the relay over UDP and TCP, and
-  cross-thread sends.
+- `test_udp`: real sockets on loopback, the relay over UDP and TCP,
+  cross-thread sends, and UPnP against a fake router.
+- `test_examples`: runs the example programs: `echo_server`/`echo_client`,
+  and two `tofu_chat` processes with the test pasting the signaling lines
+  between them, including trust-on-first-use and an impostor being refused.
+
+Tests never contact public servers or your router. The examples honour
+`PIERCE_LOCAL_ONLY=1` for the same reason.
 
 Configure with `-DPIERCE_SANITIZE=ON` (ASan + UBSan) or `-DPIERCE_TSAN=ON`.
 
@@ -115,8 +137,9 @@ Configure with `-DPIERCE_SANITIZE=ON` (ASan + UBSan) or `-DPIERCE_TSAN=ON`.
 
 v1 implements the spec's roadmap steps 1–5 as a C library.
 
-- **Platforms:** Linux is built and tested. The Windows and macOS platform
-  layers compile and link, cross-built with Zig, but have not been run.
+- **Platforms:** Linux is built and fully tested. On Windows the crypto and
+  simulator suites pass natively; the real-socket tests are not ported yet.
+  macOS compiles and links (cross-built with Zig) but has not been run.
 - **Not yet:** language wrappers, mobile ports, WASM, path-MTU discovery,
   connection-ID rotation, signed relay tokens, and a standards-compliant
   ICE mode are later steps.

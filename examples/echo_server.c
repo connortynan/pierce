@@ -8,9 +8,19 @@
  * Prints the invite as hex; pass it to echo_client.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "pierce.h"
+
+/* PIERCE_LOCAL_ONLY=1 keeps a run on this machine (used by the smoke
+   tests): no public STUN servers, no router port mapping, loopback offered. */
+static uint32_t local_only_flags(void)
+{
+    const char *e = getenv("PIERCE_LOCAL_ONLY");
+    if (!e || !*e || *e == '0') return 0;
+    return PIERCE_CFG_NO_DEFAULT_STUN | PIERCE_CFG_NO_PORT_MAPPING | PIERCE_CFG_INCLUDE_LOOPBACK;
+}
 
 int main(int argc, char **argv)
 {
@@ -21,6 +31,7 @@ int main(int argc, char **argv)
     }
     pierce_config cfg;
     pierce_config_init(&cfg);
+    cfg.flags |= local_only_flags();
     cfg.bind_port = pub.port;
     cfg.max_connections = 4096;
     pierce_ctx *ctx;

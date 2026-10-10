@@ -116,7 +116,11 @@ enum {
     PIERCE_CFG_NO_IPV6             = 1u << 1,
     PIERCE_CFG_NO_IPV4             = 1u << 2,
     PIERCE_CFG_RELAY_ONLY          = 1u << 3, /* never reveal local or reflexive addresses */
-    PIERCE_CFG_INCLUDE_LOOPBACK    = 1u << 4  /* offer loopback host candidates (testing) */
+    PIERCE_CFG_INCLUDE_LOOPBACK    = 1u << 4, /* offer loopback host candidates (testing) */
+    /* Connectivity techniques are all on by default; these opt out. */
+    PIERCE_CFG_NO_DEFAULT_STUN     = 1u << 5, /* no built-in public STUN servers */
+    PIERCE_CFG_NO_PORT_MAPPING     = 1u << 6, /* never ask the router (PCP/NAT-PMP/UPnP) */
+    PIERCE_CFG_NO_BIRTHDAY         = 1u << 7  /* no birthday-paradox hole punching */
 };
 
 enum {
@@ -131,7 +135,7 @@ typedef struct {
     uint32_t struct_size;
     const uint8_t *identity_secret_key;    /* 32-byte X25519 secret, or NULL to generate ephemeral */
     uint32_t max_connections;              /* connection table capacity; 0 = 1024 */
-    const char *const *stun_servers;       /* "host:port" strings */
+    const char *const *stun_servers;       /* "host:port"; none = built-in public servers */
     uint32_t stun_server_count;
     const char *const *relay_servers;      /* "host:port" (UDP) or "tcp://host:port" */
     uint32_t relay_server_count;
@@ -269,7 +273,7 @@ enum {
     PIERCE_EV_DISCONNECTED,
     PIERCE_EV_MESSAGE,
     PIERCE_EV_SIGNAL_OUT,         /* app must deliver to the remote peer */
-    PIERCE_EV_TRANSMIT,           /* only when builtin UDP is disabled */
+    PIERCE_EV_TRANSMIT,           /* only when builtin UDP is disabled; channel = local endpoint */
     PIERCE_EV_PATH_CHANGED,
     PIERCE_EV_SEND_BUFFER_LOW,
     PIERCE_EV_LOG
@@ -313,9 +317,16 @@ PIERCE_API const uint8_t *pierce_msg_data(void *handle, uint32_t *len_out);
 /* Copies event data. Returns length, or PIERCE_ERR_BUFFER_TOO_SMALL. */
 PIERCE_API int   pierce_event_copy(const pierce_event *ev, uint8_t *dst, uint32_t cap);
 
-/* ---- custom transports (sans-I/O) ---- */
+/* ---- custom transports (sans-I/O) ----
+   TRANSMIT events name a local endpoint in `channel`: 0 is the primary one;
+   others are extra UDP endpoints the library uses for birthday punching
+   (each must look like a separate socket with its own NAT mapping). A
+   transport that has only one endpoint may send everything from it; those
+   connections just lose that technique. */
 PIERCE_API int pierce_transport_in(pierce_ctx *ctx, const pierce_addr *src,
                                    const uint8_t *data, uint32_t len);
+PIERCE_API int pierce_transport_in_ex(pierce_ctx *ctx, uint32_t local, const pierce_addr *src,
+                                      const uint8_t *data, uint32_t len);
 
 /* ---- lifecycle hooks the host feeds in ---- */
 PIERCE_API void pierce_net_changed(pierce_ctx *ctx);

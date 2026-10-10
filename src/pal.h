@@ -78,6 +78,10 @@ void pal_wake_close(pal_wakeup *w);
 int pal_interfaces(pierce_addr *out, uint32_t cap, int include_loopback);
 /* getaddrinfo wrapper (may block). Returns count of addresses written. */
 int pal_resolve(const char *host, uint16_t port, pierce_addr *out, uint32_t cap);
+/* IPv4 default gateway (port 0). PIERCE_OK, or an error if there is none. */
+int pal_default_gateway(pierce_addr *out);
+/* The local address the OS would use to send to dst (port 0). */
+int pal_route_source(const pierce_addr *dst, pierce_addr *src);
 
 /* ---- mutex ---- */
 #if defined(_WIN32)

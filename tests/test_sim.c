@@ -28,6 +28,15 @@ static int has_msgs(sim *s, void *u)
     return s->nodes[nm[0]].nmsgs >= nm[1];
 }
 
+static int client_path_direct(sim *s, void *u)
+{
+    int node = *(int *)u;
+    pierce_conn_info info;
+    info.struct_size = sizeof(info);
+    if (pierce_conn_info_get(s->nodes[node].ctx, s->nodes[node].last_conn, &info) != PIERCE_OK) return 0;
+    return info.path == PIERCE_PATH_DIRECT;
+}
+
 static void cfg_flags(pierce_config *cfg, void *u) { cfg->flags |= *(uint32_t *)u; }
 static void cfg_idle(pierce_config *cfg, void *u)
 {
@@ -103,11 +112,9 @@ static void test_connect_modes(void)
 
 static int expect_direct(int a, int b)
 {
-    /* Pairs that hole punching cannot handle without a relay. */
-    if (a == NAT_SYMMETRIC && b == NAT_SYMMETRIC) return 0;
-    if ((a == NAT_SYMMETRIC && b == NAT_PORT_RESTRICTED) || (b == NAT_SYMMETRIC && a == NAT_PORT_RESTRICTED))
-        return 0;
-    return 1;
+    /* Symmetric <-> port-restricted needs birthday punching; only
+       symmetric on both sides is beyond any direct technique. */
+    return !(a == NAT_SYMMETRIC && b == NAT_SYMMETRIC);
 }
 
 static void test_nat_matrix(void)
@@ -131,12 +138,22 @@ static void test_nat_matrix(void)
                             nat_name(a), nat_name(b), with_relay, ok, want);
                 CHECK_EQ(ok, want);
                 if (ok) {
-                    /* Relay only when hole punching cannot work. */
-                    uint32_t want_path = expect_direct(a, b) ? PIERCE_PATH_DIRECT : PIERCE_PATH_RELAY;
-                    if (S.nodes[cli].last_path != want_path)
-                        fprintf(stderr, "  NAT %s <- %s (relay %d): path %u expected %u\n", nat_name(a),
-                                nat_name(b), with_relay, S.nodes[cli].last_path, want_path);
-                    CHECK_EQ(S.nodes[cli].last_path, want_path);
+                    /* Relay only when no direct technique works. A birthday
+                       pair may start on the relay (it validates first) but
+                       must end up direct. */
+                    int birthday = (a == NAT_SYMMETRIC) != (b == NAT_SYMMETRIC) &&
+                                   (a == NAT_PORT_RESTRICTED || b == NAT_PORT_RESTRICTED);
+                    if (expect_direct(a, b) && !(birthday && with_relay)) {
+                        CHECK_EQ(S.nodes[cli].last_path, PIERCE_PATH_DIRECT);
+                    } else if (!expect_direct(a, b)) {
+                        CHECK_EQ(S.nodes[cli].last_path, PIERCE_PATH_RELAY);
+                    }
+                    if (expect_direct(a, b)) {
+                        int ok2 = sim_run_until(&S, 12000000, client_path_direct, &cli);
+                        if (!ok2) fprintf(stderr, "  NAT %s <- %s (relay %d): never went direct\n", nat_name(a),
+                                          nat_name(b), with_relay);
+                        CHECK(ok2);
+                    }
                     pierce_send(S.nodes[cli].ctx, id, 0, (const uint8_t *)"x", 1, 0);
                     int nm[2] = {srv, 1};
                     CHECK(sim_run_until(&S, 3000000, has_msgs, nm));
@@ -751,6 +768,73 @@ static void test_stale_invite_costs_nothing(void)
     sim_free(&S);
 }
 
+/* Both symmetric: hopeless for hole punching, but a router port mapping on
+   either side makes that side reachable by anyone. */
+static void port_mapping_case(int pmp_on_server, int pmp_kind)
+{
+    sim_init(&S, 30 + (uint64_t)pmp_kind * 2 + (uint64_t)pmp_on_server);
+    sim_enable_stun(&S);
+    int ns = sim_add_nat(&S, NAT_SYMMETRIC), nc = sim_add_nat(&S, NAT_SYMMETRIC);
+    S.nats[pmp_on_server ? ns : nc].pmp = pmp_kind;
+    int srv = sim_add_node(&S, ns), cli = sim_add_node(&S, nc);
+    pierce_listen(S.nodes[srv].ctx, NULL);
+    sim_run(&S, 3000000);   /* STUN plus PCP (and the NAT-PMP fallback) */
+    int mapped_node = pmp_on_server ? srv : cli;
+    CHECK(pc_gather_sig_flags(S.nodes[mapped_node].ctx) & PC_SIG_FLAG_MAPPED);
+    pierce_conn_id id = sim_connect(&S, cli, srv, NULL, SIM_IK);
+    int ab[2] = {srv, cli};
+    CHECK(sim_run_until(&S, 10000000, both_connected, ab));
+    CHECK_EQ(S.nodes[cli].last_path, PIERCE_PATH_DIRECT);
+    CHECK_EQ(S.nodes[srv].ctx->nxsocks_used + S.nodes[cli].ctx->nxsocks_used, 0);   /* no birthday needed */
+    send_seq(S.nodes[cli].ctx, id, 0, 7, 100);
+    int nm[2] = {srv, 1};
+    CHECK(sim_run_until(&S, 2000000, has_msgs, nm));
+    sim_free(&S);
+}
+
+static void test_port_mapping_pcp(void) { port_mapping_case(1, PMP_PCP); }
+static void test_port_mapping_natpmp(void) { port_mapping_case(0, PMP_NATPMP); }
+
+static void test_double_nat_not_trusted(void)
+{
+    sim_init(&S, 40);
+    sim_enable_stun(&S);
+    int ns = sim_add_nat(&S, NAT_SYMMETRIC), nc = sim_add_nat(&S, NAT_SYMMETRIC);
+    S.nats[ns].pmp = PMP_PCP;
+    uint8_t cgnat[4] = {100, 64, 0, 9};       /* the router itself sits behind a carrier NAT */
+    memcpy(S.nats[ns].pmp_report_ip, cgnat, 4);
+    int srv = sim_add_node(&S, ns), cli = sim_add_node(&S, nc);
+    pierce_listen(S.nodes[srv].ctx, NULL);
+    sim_run(&S, 3000000);
+    CHECK(!(pc_gather_sig_flags(S.nodes[srv].ctx) & PC_SIG_FLAG_MAPPED));
+    sim_connect(&S, cli, srv, NULL, SIM_IK);
+    int ab[2] = {cli, cli};
+    CHECK(sim_run_until(&S, 30000000, any_disconnected, ab));
+    CHECK_EQ(S.nodes[cli].last_error, PIERCE_ERR_UNREACHABLE);
+    /* The app gets a reason it can show a person. */
+    CHECK(strstr(S.nodes[cli].last_warn, "both sides are behind symmetric NATs") != NULL);
+    CHECK(strstr(S.nodes[cli].last_warn, "no relay is configured") != NULL);
+    sim_free(&S);
+}
+
+static void test_birthday_opt_out(void)
+{
+    uint32_t fl = PIERCE_CFG_NO_BIRTHDAY;
+    sim_init(&S, 41);
+    sim_enable_stun(&S);
+    int srv = sim_add_node_cfg(&S, sim_add_nat(&S, NAT_SYMMETRIC), cfg_flags, &fl);
+    int cli = sim_add_node(&S, sim_add_nat(&S, NAT_PORT_RESTRICTED));
+    pierce_listen(S.nodes[srv].ctx, NULL);
+    sim_run(&S, 1500000);
+    sim_connect(&S, cli, srv, NULL, SIM_IK);
+    int ab[2] = {cli, cli};
+    CHECK(sim_run_until(&S, 30000000, any_disconnected, ab));
+    CHECK_EQ(S.nodes[cli].last_error, PIERCE_ERR_UNREACHABLE);
+    CHECK(strstr(S.nodes[cli].last_warn, "one side is behind a symmetric NAT") != NULL);
+    CHECK_EQ(S.nodes[srv].ctx->nxsocks_used, 0);
+    sim_free(&S);
+}
+
 static int got_request(sim *s, void *u) { return s->nodes[*(int *)u].peer_requests > 0; }
 
 static void test_handshake_payload(void)
@@ -825,5 +909,9 @@ int main(void)
     RUN(test_handshake_payload);
     RUN(test_accept_timeout);
     RUN(test_stale_invite_costs_nothing);
+    RUN(test_port_mapping_pcp);
+    RUN(test_port_mapping_natpmp);
+    RUN(test_double_nat_not_trusted);
+    RUN(test_birthday_opt_out);
     TEST_MAIN_END();
 }
